@@ -19,6 +19,8 @@
 -export([new/14]).
 -export([method/1]).
 -export([version/1]).
+-export([transport/1]).
+-export([socket/1]).
 -export([peer/1]).
 -export([host/1]).
 -export([host_info/1]).
@@ -200,6 +202,18 @@ method(Req) ->
 -spec version(Req) -> {cowboy:http_version(), Req} when Req::req().
 version(Req) ->
 	{Req#http_req.version, Req}.
+
+-spec transport(Req)
+	-> {undefined | module(), Req}
+	when Req::req().
+transport(Req) ->
+	{Req#http_req.transport, Req}.
+  
+-spec socket(Req)
+	-> {any(), Req}
+	when Req::req().
+socket(Req) ->
+	{Req#http_req.socket, Req}.
 
 -spec peer(Req)
 	-> {{inet:ip_address(), inet:port_number()}, Req}
