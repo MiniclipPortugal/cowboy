@@ -1,3 +1,4 @@
+% vim: set noexpandtab softtabstop=4 shiftwidth=4:
 %% Copyright (c) 2011-2017, Loïc Hoguin <essen@ninenines.eu>
 %%
 %% Permission to use, copy, modify, and/or distribute this software for any
@@ -17,7 +18,8 @@
 -module(cowboy_websocket).
 -behaviour(cowboy_sub_protocol).
 
--export([upgrade/6]).
+-export([upgrade/4]).
+-export([upgrade/5]).
 -export([takeover/7]).
 -export([handler_loop/3]).
 
@@ -34,9 +36,7 @@
 
 -callback init(Req, any())
 	-> {ok | module(), Req, any()}
-	| {module(), Req, any(), hibernate}
-	| {module(), Req, any(), timeout()}
-	| {module(), Req, any(), timeout(), hibernate}
+	| {module(), Req, any(), any()}
 	when Req::cowboy_req:req().
 
 -callback websocket_init(State)
@@ -48,38 +48,62 @@
 -callback websocket_info(any(), State)
 	-> call_result(State) when State::any().
 
-%% @todo OK this I am not sure what to do about it. We don't have a Req anymore.
-%% We probably should have a websocket_terminate instead.
 -callback terminate(any(), cowboy_req:req(), any()) -> ok.
 -optional_callbacks([terminate/3]).
 
+-type opts() :: #{
+	compress => boolean(),
+	idle_timeout => timeout(),
+	req_filter => fun((cowboy_req:req()) -> map())
+}.
+-export_type([opts/0]).
+
 -record(state, {
-	socket = undefined :: inet:socket() | undefined,
+	socket = undefined :: gen_tcp:socket() | ssl:sslsocket() | tuple() | undefined,
 	transport = undefined :: module(),
 	handler :: module(),
 	key = undefined :: undefined | binary(),
 	timeout = infinity :: timeout(),
 	timeout_ref = undefined :: undefined | reference(),
+	compress = false :: boolean(),
 	messages = undefined :: undefined | {atom(), atom(), atom()},
 	hibernate = false :: boolean(),
 	frag_state = undefined :: cow_ws:frag_state(),
 	frag_buffer = <<>> :: binary(),
 	utf8_state = 0 :: cow_ws:utf8_state(),
-	extensions = #{} :: map()
+	extensions = #{} :: map(),
+	req = #{} :: map()
 }).
 
 %% Stream process.
 
--spec upgrade(Req, Env, module(), any(), timeout(), run | hibernate)
+-spec upgrade(Req, Env, module(), any())
+	-> {ok, Req, Env}
+	when Req::cowboy_req:req(), Env::cowboy_middleware:env().
+upgrade(Req, Env, Handler, HandlerState) ->
+	upgrade(Req, Env, Handler, HandlerState, #{}).
+
+-spec upgrade(Req, Env, module(), any(), opts())
 	-> {ok, Req, Env}
 	when Req::cowboy_req:req(), Env::cowboy_middleware:env().
 %% @todo Immediately crash if a response has already been sent.
 %% @todo Error out if HTTP/2.
-upgrade(Req0, Env, Handler, HandlerState, Timeout, Hibernate) ->
-	try websocket_upgrade(#state{handler=Handler, timeout=Timeout,
-			hibernate=Hibernate =:= hibernate}, Req0) of
+upgrade(Req0, Env, Handler, HandlerState, Opts) ->
+	Timeout = maps:get(idle_timeout, Opts, 60000),
+	Compress = maps:get(compress, Opts, false),
+	FilteredReq = case maps:get(req_filter, Opts, undefined) of
+		undefined -> maps:with([method, version, scheme, host, port, path, qs, peer], Req0);
+		FilterFun -> FilterFun(Req0)
+	end,
+	State0 = #state{handler=Handler, timeout=Timeout, compress=Compress, req=FilteredReq},
+	try websocket_upgrade(State0, Req0) of
 		{ok, State, Req} ->
-			websocket_handshake(State, Req, HandlerState, Env)
+			websocket_handshake(State, Req, HandlerState, Env);
+		{error, upgrade_required} ->
+			{ok, cowboy_req:reply(426, #{
+				<<"connection">> => <<"upgrade">>,
+				<<"upgrade">> => <<"websocket">>
+			}, Req0), Env}
 	catch _:_ ->
 		%% @todo Probably log something here?
 		%% @todo Test that we can have 2 /ws 400 status code in a row on the same connection.
@@ -87,31 +111,34 @@ upgrade(Req0, Env, Handler, HandlerState, Timeout, Hibernate) ->
 		{ok, cowboy_req:reply(400, Req0), Env}
 	end.
 
--spec websocket_upgrade(#state{}, Req)
-	-> {ok, #state{}, Req} when Req::cowboy_req:req().
 websocket_upgrade(State, Req) ->
-	ConnTokens = cowboy_req:parse_header(<<"connection">>, Req),
-	true = lists:member(<<"upgrade">>, ConnTokens),
-	%% @todo Should probably send a 426 if the Upgrade header is missing.
-	[<<"websocket">>] = cowboy_req:parse_header(<<"upgrade">>, Req),
-	Version = cowboy_req:header(<<"sec-websocket-version">>, Req),
-	IntVersion = binary_to_integer(Version),
-	true = (IntVersion =:= 7) orelse (IntVersion =:= 8)
-		orelse (IntVersion =:= 13),
-	Key = cowboy_req:header(<<"sec-websocket-key">>, Req),
-	false = Key =:= undefined,
-	websocket_extensions(State#state{key=Key}, Req#{websocket_version => IntVersion}).
+	ConnTokens = cowboy_req:parse_header(<<"connection">>, Req, []),
+	case lists:member(<<"upgrade">>, ConnTokens) of
+		false ->
+			{error, upgrade_required};
+		true ->
+			UpgradeTokens = cowboy_req:parse_header(<<"upgrade">>, Req, []),
+			case lists:member(<<"websocket">>, UpgradeTokens) of
+				false ->
+					{error, upgrade_required};
+				true ->
+					Version = cowboy_req:header(<<"sec-websocket-version">>, Req),
+					IntVersion = binary_to_integer(Version),
+					true = (IntVersion =:= 7) orelse (IntVersion =:= 8)
+						orelse (IntVersion =:= 13),
+					Key = cowboy_req:header(<<"sec-websocket-key">>, Req),
+					false = Key =:= undefined,
+					websocket_extensions(State#state{key=Key}, Req#{websocket_version => IntVersion})
+			end
+	end.
 
--spec websocket_extensions(#state{}, Req)
-	-> {ok, #state{}, Req} when Req::cowboy_req:req().
-websocket_extensions(State, Req=#{ref := Ref}) ->
+websocket_extensions(State=#state{compress=Compress}, Req) ->
 	%% @todo We want different options for this. For example
 	%% * compress everything auto
 	%% * compress only text auto
 	%% * compress only binary auto
 	%% * compress nothing auto (but still enabled it)
 	%% * disable compression
-	Compress = maps:get(websocket_compress, ranch:get_protocol_options(Ref), false),
 	case {Compress, cowboy_req:parse_header(<<"sec-websocket-extensions">>, Req)} of
 		{true, Extensions} when Extensions =/= undefined ->
 			websocket_extensions(State, Req, Extensions, []);
@@ -127,23 +154,27 @@ websocket_extensions(State=#state{extensions=Extensions}, Req=#{pid := Pid},
 		[{<<"permessage-deflate">>, Params}|Tail], RespHeader) ->
 	%% @todo Make deflate options configurable.
 	Opts = #{level => best_compression, mem_level => 8, strategy => default},
-	case cow_ws:negotiate_permessage_deflate(Params, Extensions, Opts#{owner => Pid}) of
+	try cow_ws:negotiate_permessage_deflate(Params, Extensions, Opts#{owner => Pid}) of
 		{ok, RespExt, Extensions2} ->
 			websocket_extensions(State#state{extensions=Extensions2},
 				Req, Tail, [<<", ">>, RespExt|RespHeader]);
 		ignore ->
 			websocket_extensions(State, Req, Tail, RespHeader)
+	catch exit:{error, incompatible_zlib_version, _} ->
+		websocket_extensions(State, Req, Tail, RespHeader)
 	end;
 websocket_extensions(State=#state{extensions=Extensions}, Req=#{pid := Pid},
 		[{<<"x-webkit-deflate-frame">>, Params}|Tail], RespHeader) ->
 	%% @todo Make deflate options configurable.
 	Opts = #{level => best_compression, mem_level => 8, strategy => default},
-	case cow_ws:negotiate_x_webkit_deflate_frame(Params, Extensions, Opts#{owner => Pid}) of
+	try cow_ws:negotiate_x_webkit_deflate_frame(Params, Extensions, Opts#{owner => Pid}) of
 		{ok, RespExt, Extensions2} ->
 			websocket_extensions(State#state{extensions=Extensions2},
 				Req, Tail, [<<", ">>, RespExt|RespHeader]);
 		ignore ->
 			websocket_extensions(State, Req, Tail, RespHeader)
+	catch exit:{error, incompatible_zlib_version, _} ->
+		websocket_extensions(State, Req, Tail, RespHeader)
 	end;
 websocket_extensions(State, Req, [_|Tail], RespHeader) ->
 	websocket_extensions(State, Req, Tail, RespHeader).
@@ -155,6 +186,7 @@ websocket_handshake(State=#state{key=Key},
 		Req=#{pid := Pid, streamid := StreamID}, HandlerState, Env) ->
 	Challenge = base64:encode(crypto:hash(sha,
 		<< Key/binary, "258EAFA5-E914-47DA-95CA-C5AB0DC85B11" >>)),
+	%% @todo We don't want date and server headers.
 	Headers = cowboy_req:response_headers(#{
 		<<"connection">> => <<"Upgrade">>,
 		<<"upgrade">> => <<"websocket">>,
@@ -170,6 +202,7 @@ websocket_handshake(State=#state{key=Key},
 	{#state{}, any()}) -> ok.
 takeover(_Parent, Ref, Socket, Transport, _Opts, Buffer,
 		{State0=#state{handler=Handler}, HandlerState}) ->
+	%% @todo We should have an option to disable this behavior.
 	ranch:remove_connection(Ref),
 	State1 = handler_loop_timeout(State0#state{socket=Socket, transport=Transport}),
 	State = State1#state{key=undefined, messages=Transport:messages()},
@@ -205,15 +238,16 @@ handler_loop_timeout(State=#state{timeout=Timeout, timeout_ref=PrevRef}) ->
 	-> {ok, cowboy_middleware:env()}.
 handler_loop(State=#state{socket=Socket, messages={OK, Closed, Error},
 		timeout_ref=TRef}, HandlerState, SoFar) ->
+	SocketSender = socket_sender(Socket),
 	receive
-		{OK, Socket, Data} ->
+		{OK, SocketSender, Data} ->
 			State2 = handler_loop_timeout(State),
 			websocket_data(State2, HandlerState,
 				<< SoFar/binary, Data/binary >>);
-		{Closed, Socket} ->
-			handler_terminate(State, HandlerState, {error, closed});
-		{Error, Socket, Reason} ->
-			handler_terminate(State, HandlerState, {error, Reason});
+		{Closed, SocketSender} ->
+			terminate(State, HandlerState, {error, closed});
+		{Error, SocketSender, Reason} ->
+			terminate(State, HandlerState, {error, Reason});
 		{timeout, TRef, ?MODULE} ->
 			websocket_close(State, HandlerState, timeout);
 		{timeout, OlderTRef, ?MODULE} when is_reference(OlderTRef) ->
@@ -263,15 +297,16 @@ websocket_payload_loop(State=#state{socket=Socket, transport=Transport,
 		messages={OK, Closed, Error}, timeout_ref=TRef},
 		HandlerState, Type, Len, MaskKey, Rsv, CloseCode, Unmasked, UnmaskedLen) ->
 	Transport:setopts(Socket, [{active, once}]),
+	SocketSender = socket_sender(Socket),
 	receive
-		{OK, Socket, Data} ->
+		{OK, SocketSender, Data} ->
 			State2 = handler_loop_timeout(State),
 			websocket_payload(State2, HandlerState,
 				Type, Len, MaskKey, Rsv, CloseCode, Unmasked, UnmaskedLen, Data);
-		{Closed, Socket} ->
-			handler_terminate(State, HandlerState, {error, closed});
-		{Error, Socket, Reason} ->
-			handler_terminate(State, HandlerState, {error, Reason});
+		{Closed, SocketSender} ->
+			terminate(State, HandlerState, {error, closed});
+		{Error, SocketSender, Reason} ->
+			terminate(State, HandlerState, {error, Reason});
 		{timeout, TRef, ?MODULE} ->
 			websocket_close(State, HandlerState, timeout);
 		{timeout, OlderTRef, ?MODULE} when is_reference(OlderTRef) ->
@@ -325,9 +360,9 @@ handler_call(State=#state{handler=Handler}, HandlerState,
 				ok ->
 					NextState(State, HandlerState2, RemainingData);
 				stop ->
-					handler_terminate(State, HandlerState2, stop);
+					terminate(State, HandlerState2, stop);
 				Error = {error, _} ->
-					handler_terminate(State, HandlerState2, Error)
+					terminate(State, HandlerState2, Error)
 			end;
 		{reply, Payload, HandlerState2, hibernate} ->
 			case websocket_send(Payload, State) of
@@ -335,14 +370,15 @@ handler_call(State=#state{handler=Handler}, HandlerState,
 					NextState(State#state{hibernate=true},
 						HandlerState2, RemainingData);
 				stop ->
-					handler_terminate(State, HandlerState2, stop);
+					terminate(State, HandlerState2, stop);
 				Error = {error, _} ->
-					handler_terminate(State, HandlerState2, Error)
+					terminate(State, HandlerState2, Error)
 			end;
 		{stop, HandlerState2} ->
 			websocket_close(State, HandlerState2, stop)
 	catch Class:Reason ->
-		_ = websocket_close(State, HandlerState, {crash, Class, Reason}),
+		websocket_send_close(State, {crash, Class, Reason}),
+		handler_terminate(State, HandlerState, {crash, Class, Reason}),
 		erlang:raise(Class, Reason, erlang:get_stacktrace())
 	end.
 
@@ -375,9 +411,13 @@ is_close_frame({close, _, _}) -> true;
 is_close_frame(_) -> false.
 
 -spec websocket_close(#state{}, any(), terminate_reason()) -> no_return().
-websocket_close(State=#state{socket=Socket, transport=Transport, extensions=Extensions},
-		HandlerState, Reason) ->
-	case Reason of
+websocket_close(State, HandlerState, Reason) ->
+	websocket_send_close(State, Reason),
+	terminate(State, HandlerState, Reason).
+
+websocket_send_close(#state{socket=Socket, transport=Transport,
+		extensions=Extensions}, Reason) ->
+	_ = case Reason of
 		Normal when Normal =:= stop; Normal =:= timeout ->
 			Transport:send(Socket, cow_ws:frame({close, 1000, <<>>}, Extensions));
 		{error, badframe} ->
@@ -391,10 +431,18 @@ websocket_close(State=#state{socket=Socket, transport=Transport, extensions=Exte
 		{remote, Code, _} ->
 			Transport:send(Socket, cow_ws:frame({close, Code, <<>>}, Extensions))
 	end,
-	handler_terminate(State, HandlerState, Reason).
+	ok.
 
--spec handler_terminate(#state{}, any(), terminate_reason()) -> no_return().
-handler_terminate(#state{handler=Handler},
-		HandlerState, Reason) ->
-	cowboy_handler:terminate(Reason, undefined, HandlerState, Handler),
+-spec terminate(#state{}, any(), terminate_reason()) -> no_return().
+terminate(State, HandlerState, Reason) ->
+	handler_terminate(State, HandlerState, Reason),
 	exit(normal).
+
+handler_terminate(#state{handler=Handler, req=Req}, HandlerState, Reason) ->
+	cowboy_handler:terminate(Reason, Req, HandlerState, Handler).
+
+socket_sender({proxy_socket, _LSocket, CSocket, _Opts, _InetVersion,
+			   _SourceAddr, _DestAddr, _SourcePort, _DestPort, _ConnInfo}) ->
+	CSocket;
+socket_sender(OrdinarySocket) ->
+	OrdinarySocket.

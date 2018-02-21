@@ -14,27 +14,28 @@
 
 -module(cowboy_test).
 -compile(export_all).
+-compile(nowarn_export_all).
 
 -import(ct_helper, [config/2]).
 
 %% Listeners initialization.
 
 init_http(Ref, ProtoOpts, Config) ->
-	{ok, _} = cowboy:start_clear(Ref, 100, [{port, 0}], ProtoOpts),
+	{ok, _} = cowboy:start_clear(Ref, [{port, 0}], ProtoOpts),
 	Port = ranch:get_port(Ref),
-	[{type, tcp}, {protocol, http}, {port, Port}, {opts, []}|Config].
+	[{ref, Ref}, {type, tcp}, {protocol, http}, {port, Port}, {opts, []}|Config].
 
 init_https(Ref, ProtoOpts, Config) ->
 	Opts = ct_helper:get_certs_from_ets(),
-	{ok, _} = cowboy:start_tls(Ref, 100, Opts ++ [{port, 0}], ProtoOpts),
+	{ok, _} = cowboy:start_tls(Ref, Opts ++ [{port, 0}], ProtoOpts),
 	Port = ranch:get_port(Ref),
-	[{type, ssl}, {protocol, http}, {port, Port}, {opts, Opts}|Config].
+	[{ref, Ref}, {type, ssl}, {protocol, http}, {port, Port}, {opts, Opts}|Config].
 
 init_http2(Ref, ProtoOpts, Config) ->
 	Opts = ct_helper:get_certs_from_ets(),
-	{ok, _} = cowboy:start_tls(Ref, 100, Opts ++ [{port, 0}], ProtoOpts),
+	{ok, _} = cowboy:start_tls(Ref, Opts ++ [{port, 0}], ProtoOpts),
 	Port = ranch:get_port(Ref),
-	[{type, ssl}, {protocol, http2}, {port, Port}, {opts, Opts}|Config].
+	[{ref, Ref}, {type, ssl}, {protocol, http2}, {port, Port}, {opts, Opts}|Config].
 
 %% Common group of listeners used by most suites.
 
@@ -65,40 +66,40 @@ common_groups(Tests) ->
 init_common_groups(Name = http, Config, Mod) ->
 	init_http(Name, #{
 		env => #{dispatch => Mod:init_dispatch(Config)}
-	}, Config);
+	}, [{flavor, vanilla}|Config]);
 init_common_groups(Name = https, Config, Mod) ->
 	init_https(Name, #{
 		env => #{dispatch => Mod:init_dispatch(Config)}
-	}, Config);
+	}, [{flavor, vanilla}|Config]);
 init_common_groups(Name = h2, Config, Mod) ->
 	init_http2(Name, #{
 		env => #{dispatch => Mod:init_dispatch(Config)}
-	}, Config);
+	}, [{flavor, vanilla}|Config]);
 init_common_groups(Name = h2c, Config, Mod) ->
 	Config1 = init_http(Name, #{
 		env => #{dispatch => Mod:init_dispatch(Config)}
-	}, Config),
+	}, [{flavor, vanilla}|Config]),
 	lists:keyreplace(protocol, 1, Config1, {protocol, http2});
 init_common_groups(Name = http_compress, Config, Mod) ->
 	init_http(Name, #{
 		env => #{dispatch => Mod:init_dispatch(Config)},
 		stream_handlers => [cowboy_compress_h, cowboy_stream_h]
-	}, Config);
+	}, [{flavor, compress}|Config]);
 init_common_groups(Name = https_compress, Config, Mod) ->
 	init_https(Name, #{
 		env => #{dispatch => Mod:init_dispatch(Config)},
 		stream_handlers => [cowboy_compress_h, cowboy_stream_h]
-	}, Config);
+	}, [{flavor, compress}|Config]);
 init_common_groups(Name = h2_compress, Config, Mod) ->
 	init_http2(Name, #{
 		env => #{dispatch => Mod:init_dispatch(Config)},
 		stream_handlers => [cowboy_compress_h, cowboy_stream_h]
-	}, Config);
+	}, [{flavor, compress}|Config]);
 init_common_groups(Name = h2c_compress, Config, Mod) ->
 	Config1 = init_http(Name, #{
 		env => #{dispatch => Mod:init_dispatch(Config)},
 		stream_handlers => [cowboy_compress_h, cowboy_stream_h]
-	}, Config),
+	}, [{flavor, compress}|Config]),
 	lists:keyreplace(protocol, 1, Config1, {protocol, http2}).
 
 %% Support functions for testing using Gun.
@@ -110,6 +111,7 @@ gun_open(Config, Opts) ->
 	{ok, ConnPid} = gun:open("localhost", config(port, Config), Opts#{
 		retry => 0,
 		transport => config(type, Config),
+		transport_opts => proplists:get_value(transport_opts, Config, []),
 		protocols => [config(protocol, Config)]
 	}),
 	ConnPid.

@@ -14,6 +14,7 @@
 
 -module(loop_handler_SUITE).
 -compile(export_all).
+-compile(nowarn_export_all).
 
 -import(ct_helper, [config/2]).
 -import(ct_helper, [doc/1]).
@@ -48,7 +49,7 @@ long_polling(Config) ->
 	doc("Simple long-polling."),
 	ConnPid = gun_open(Config),
 	Ref = gun:get(ConnPid, "/long_polling", [{<<"accept-encoding">>, <<"gzip">>}]),
-	{response, fin, 102, _} = gun:await(ConnPid, Ref),
+	{response, fin, 299, _} = gun:await(ConnPid, Ref),
 	ok.
 
 long_polling_body(Config) ->
@@ -56,7 +57,7 @@ long_polling_body(Config) ->
 	ConnPid = gun_open(Config),
 	Ref = gun:post(ConnPid, "/long_polling", [{<<"accept-encoding">>, <<"gzip">>}],
 		<< 0:5000/unit:8 >>),
-	{response, fin, 102, _} = gun:await(ConnPid, Ref),
+	{response, fin, 299, _} = gun:await(ConnPid, Ref),
 	ok.
 
 long_polling_body_too_large(Config) ->
@@ -72,7 +73,7 @@ long_polling_pipeline(Config) ->
 	ConnPid = gun_open(Config),
 	Refs = [gun:get(ConnPid, "/long_polling", [{<<"accept-encoding">>, <<"gzip">>}])
 		|| _ <- lists:seq(1, 2)],
-	_ = [{response, fin, 102, _} = gun:await(ConnPid, Ref) || Ref <- Refs],
+	_ = [{response, fin, 299, _} = gun:await(ConnPid, Ref) || Ref <- Refs],
 	ok.
 
 loop_body(Config) ->
@@ -83,9 +84,9 @@ loop_body(Config) ->
 	{response, fin, 200, _} = gun:await(ConnPid, Ref),
 	ok.
 
-loop_timeout(Config) ->
-	doc("Ensure that the loop handler timeout results in a 204 response."),
+loop_request_timeout(Config) ->
+	doc("Ensure that the request_timeout isn't applied when a request is ongoing."),
 	ConnPid = gun_open(Config),
 	Ref = gun:get(ConnPid, "/loop_timeout", [{<<"accept-encoding">>, <<"gzip">>}]),
-	{response, fin, 204, _} = gun:await(ConnPid, Ref),
+	{response, nofin, 200, _} = gun:await(ConnPid, Ref, 10000),
 	ok.

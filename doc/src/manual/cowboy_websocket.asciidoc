@@ -10,31 +10,6 @@ The module `cowboy_websocket` implements Websocket
 as a Ranch protocol. It also defines a callback interface
 for handling Websocket connections.
 
-== Options
-
-[source,erlang]
-----
-opts() :: #{
-    websocket_compress := boolean()
-}
-----
-
-Configuration for the Websocket protocol.
-
-This configuration is passed to Cowboy when starting listeners
-using `cowboy:start_clear/4` or `cowboy:start_tls/4` functions.
-
-It can be updated without restarting listeners using the
-Ranch functions `ranch:get_protocol_options/1` and
-`ranch:set_protocol_options/2`.
-
-The default value is given next to the option name:
-
-websocket_compress (false)::
-    Whether to enable the Websocket frame compression
-    extension. Frames will only be compressed for the
-    clients that support this extension.
-
 == Callbacks
 
 Websocket handlers must implement the following callback
@@ -44,20 +19,20 @@ interface:
 ----
 init(Req, State)
     -> {cowboy_websocket, Req, State}
-     | {cowboy_websocket, Req, State, hibernate}
-     | {cowboy_websocket, Req, State, timeout()}
-     | {cowboy_websocket, Req, State, timeout(), hibernate}
+     | {cowboy_websocket, Req, State, Opts}
 
 websocket_init(State)            -> CallResult  %% optional
 websocket_handle(InFrame, State) -> CallResult
 websocket_info(Info, State)      -> CallResult
 
-terminate(Reason, undefined, State) -> ok       %% optional
+terminate(Reason, PartialReq, State) -> ok      %% optional
 
 Req        :: cowboy_req:req()
+PartialReq :: map()
 State      :: any()
+Opts       :: cowboy_websocket:opts()
 InFrame    :: {text | binary | ping | pong, binary()}
-OutFrame   :: cow_ws:frame()
+OutFrame   :: cow_ws:frame()                    %% see types below
 Info       :: any()
 
 CallResult :: {ok, State}
@@ -100,9 +75,8 @@ tuple).
 
 The optional `terminate/3` callback will ultimately be called
 with the reason for the termination of the connection. This
-callback is common to all handlers. Note that Websocket has
-no concept of requests so it sets the second argument to
-undefined.
+callback is common to all handlers. Note that Websocket will
+not provide the full Req object by default, to save memory.
 
 Cowboy will terminate the process right after closing the
 Websocket connection. This means that there is no need to
@@ -151,6 +125,68 @@ timeout::
 
 {error, Reason}::
     A socket error ocurred.
+
+== Types
+
+==== cow_ws:frame()
+
+[source,erlang]
+----
+frame() :: {text, iodata()}
+    | {binary, iodata()}
+    | ping | {ping, iodata()}
+    | pong | {pong, iodata()}
+    | close | {close, iodata()} | {close, close_code(), iodata()}
+
+close_code() :: 1000..1003 | 1006..1011 | 3000..4999
+----
+
+Websocket frames that can be sent as a response.
+
+Note that there is no need to send pong frames back as
+Cowboy does it automatically for you.
+
+=== opts()
+
+[source,erlang]
+----
+opts() :: #{
+    compress => boolean(),
+    idle_timeout => timeout(),
+    req_filter => fun((cowboy_req:req()) -> map())
+}
+----
+
+Websocket handler options.
+
+This configuration is passed to Cowboy from the `init/2`
+function:
+
+[source,erlang]
+----
+init(Req, State) ->
+    Opts = #{compress => true},
+    {cowboy_websocket, Req, State, Opts}.
+----
+
+The default value is given next to the option name:
+
+compress (false)::
+    Whether to enable the Websocket frame compression
+    extension. Frames will only be compressed for the
+    clients that support this extension.
+
+idle_timeout (60000)::
+    Time in milliseconds that Cowboy will keep the
+    connection open without receiving anything from
+    the client.
+
+req_filter::
+    A function applied to the Req to compact it and
+    only keep required information. The Req is only
+    given back in the `terminate/3` callback. By default
+    it keeps the method, version, URI components and peer
+    information.
 
 == Changelog
 

@@ -19,6 +19,7 @@
 -export([data/4]).
 -export([info/3]).
 -export([terminate/3]).
+-export([early_error/5]).
 
 -record(state, {
 	next :: any(),
@@ -55,10 +56,17 @@ terminate(StreamID, Reason, #state{next=Next, deflate=Z}) ->
 	end,
 	cowboy_stream:terminate(StreamID, Reason, Next).
 
+-spec early_error(cowboy_stream:streamid(), cowboy_stream:reason(),
+	cowboy_stream:partial_req(), Resp, cowboy:opts()) -> Resp
+	when Resp::cowboy_stream:resp_command().
+early_error(StreamID, Reason, PartialReq, Resp, Opts) ->
+	cowboy_stream:early_error(StreamID, Reason, PartialReq, Resp, Opts).
+
 %% Internal.
 
 %% Check if the client supports decoding of gzip responses.
 check_req(Req) ->
+	%% @todo Probably shouldn't unconditionally crash on failure.
 	case cowboy_req:parse_header(<<"accept-encoding">>, Req) of
 		%% Client doesn't support any compression algorithm.
 		undefined ->
@@ -121,8 +129,12 @@ fold([Response0={headers, _, Headers}|Tail], State0, Acc) ->
 fold([Data0={data, _, _}|Tail], State0=#state{compress=gzip}, Acc) ->
 	{Data, State} = gzip_data(Data0, State0),
 	fold(Tail, State, [Data|Acc]);
-%% Otherwise, we either have an unrelated command, or a data command
-%% with compression disabled.
+%% When trailers are sent we need to end the compression.
+%% This results in an extra data command being sent.
+fold([Trailers={trailers, _}|Tail], State0=#state{compress=gzip}, Acc) ->
+	{{data, fin, Data}, State} = gzip_data({data, fin, <<>>}, State0),
+	fold(Tail, State, [Trailers, {data, nofin, Data}|Acc]);
+%% Otherwise, we have an unrelated command or compression is disabled.
 fold([Command|Tail], State, Acc) ->
 	fold(Tail, State, [Command|Acc]).
 

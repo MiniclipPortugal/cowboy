@@ -29,6 +29,12 @@ and to read the body once.
 
 == Exports
 
+Connection:
+
+* link:man:cowboy_req:peer(3)[cowboy_req:peer(3)] - Peer address and port
+* link:man:cowboy_req:sock(3)[cowboy_req:sock(3)] - Socket address and port
+* link:man:cowboy_req:cert(3)[cowboy_req:cert(3)] - Client TLS certificate
+
 Raw request:
 
 * link:man:cowboy_req:method(3)[cowboy_req:method(3)] - HTTP method
@@ -41,7 +47,6 @@ Raw request:
 * link:man:cowboy_req:uri(3)[cowboy_req:uri(3)] - Reconstructed URI
 * link:man:cowboy_req:header(3)[cowboy_req:header(3)] - HTTP header
 * link:man:cowboy_req:headers(3)[cowboy_req:headers(3)] - HTTP headers
-* link:man:cowboy_req:peer(3)[cowboy_req:peer(3)] - Peer address and port
 
 Processed request:
 
@@ -75,9 +80,11 @@ Response:
 * link:man:cowboy_req:delete_resp_header(3)[cowboy_req:delete_resp_header(3)] - Delete a response header
 * link:man:cowboy_req:set_resp_body(3)[cowboy_req:set_resp_body(3)] - Set the response body
 * link:man:cowboy_req:has_resp_body(3)[cowboy_req:has_resp_body(3)] - Is there a response body?
+* link:man:cowboy_req:inform(3)[cowboy_req:inform(3)] - Send an informational response
 * link:man:cowboy_req:reply(3)[cowboy_req:reply(3)] - Send the response
 * link:man:cowboy_req:stream_reply(3)[cowboy_req:stream_reply(3)] - Send the response headers
 * link:man:cowboy_req:stream_body(3)[cowboy_req:stream_body(3)] - Stream the response body
+* link:man:cowboy_req:stream_trailers(3)[cowboy_req:stream_trailers(3)] - Send the response trailers
 * link:man:cowboy_req:push(3)[cowboy_req:push(3)] - Push a resource to the client
 
 == Types
@@ -129,7 +136,9 @@ req() :: #{
     path    := binary(),               %% case sensitive
     qs      := binary(),               %% case sensitive
     headers := cowboy:http_headers(),
-    peer    := {inet:ip_address(), inet:port_number()}
+    peer    := {inet:ip_address(), inet:port_number()},
+    sock    := {inet:ip_address(), inet:port_number()},
+    cert    := binary() | undefined
 }
 ----
 
@@ -156,7 +165,7 @@ resp_body() :: iodata()
     | {sendfile, Offset, Length, Filename}
 
 Offset   :: non_neg_integer()
-Length   :: pos_integer()
+Length   :: non_neg_integer()
 Filename :: file:name_all()
 ----
 
@@ -180,16 +189,9 @@ order they should be sent:
 Hello world!
 ----
 
-When using the sendfile tuple, the `Length` value is mandatory
-and must be higher than 0. It is sent with the response in the
-content-length header.
-
-// @todo Make sure we have a test with an empty file...
-// @todo cowboy_static should probably NOT return a sendfile tuple if size is 0.
-
-//%% While sendfile allows a Len of 0 that means "everything past Offset",
-//%% Cowboy expects the real length as it is used as metadata.
-//%% @todo We should probably explicitly reject it.
+Note that the length must be greater than zero for any data
+to be sent. Cowboy will send an empty body when the length
+is zero.
 
 == See also
 

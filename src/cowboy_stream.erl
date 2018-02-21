@@ -25,25 +25,26 @@
 
 %% @todo Perhaps it makes more sense to have resp_body in this module?
 
--type commands() :: [{response, cowboy:http_status(), cowboy:http_headers(), cowboy_req:resp_body()}
+-type resp_command()
+	:: {response, cowboy:http_status(), cowboy:http_headers(), cowboy_req:resp_body()}.
+-export_type([resp_command/0]).
+
+-type commands() :: [{inform, cowboy:http_status(), cowboy:http_headers()}
+	| resp_command()
 	| {headers, cowboy:http_status(), cowboy:http_headers()}
 	| {data, fin(), iodata()}
+	| {trailers, cowboy:http_headers()}
 	| {push, binary(), binary(), binary(), inet:port_number(),
 		binary(), binary(), cowboy:http_headers()}
-	| {flow, auto | integer()}
+	| {flow, pos_integer()}
 	| {spawn, pid(), timeout()}
 	| {error_response, cowboy:http_status(), cowboy:http_headers(), iodata()}
-	| {internal_error, any(), human_reason()}
 	| {switch_protocol, cowboy:http_headers(), module(), state()}
-	%% @todo I'm not convinced we need this 'stop' command.
-	%% It's used on crashes, but error_response should
-	%% terminate the request instead. It's also used on
-	%% normal exits of children. I'm not sure what to do
-	%% there yet. Investigate.
+	| {internal_error, any(), human_reason()}
 	| stop].
 -export_type([commands/0]).
 
--type reason() :: normal
+-type reason() :: normal | switch_protocol
 	| {internal_error, timeout | {error | exit | throw, any()}, human_reason()}
 	| {socket_error, closed | atom(), human_reason()}
 	| {stream_error, cow_http2:error(), human_reason()}
@@ -51,10 +52,15 @@
 	| {stop, cow_http2:frame(), human_reason()}.
 -export_type([reason/0]).
 
+-type partial_req() :: map(). %% @todo Take what's in cowboy_req with everything? optional.
+-export_type([partial_req/0]).
+
 -callback init(streamid(), cowboy_req:req(), cowboy:opts()) -> {commands(), state()}.
 -callback data(streamid(), fin(), binary(), State) -> {commands(), State} when State::state().
 -callback info(streamid(), any(), State) -> {commands(), State} when State::state().
 -callback terminate(streamid(), reason(), state()) -> any().
+-callback early_error(streamid(), reason(), partial_req(), Resp, cowboy:opts())
+	-> Resp when Resp::resp_command().
 
 %% @todo To optimize the number of active timers we could have a command
 %% that enables a timeout that is called in the absence of any other call,
@@ -71,6 +77,8 @@
 -export([data/4]).
 -export([info/3]).
 -export([terminate/3]).
+-export([early_error/5]).
+-export([report_error/5]).
 
 %% Note that this and other functions in this module do NOT catch
 %% exceptions. We want the exception to go all the way down to the
@@ -127,3 +135,60 @@ terminate(_, _, undefined) ->
 terminate(StreamID, Reason, {Handler, State}) ->
 	_ = Handler:terminate(StreamID, Reason, State),
 	ok.
+
+-spec early_error(streamid(), reason(), partial_req(), Resp, cowboy:opts())
+	-> Resp when Resp::resp_command().
+early_error(StreamID, Reason, PartialReq, Resp, Opts) ->
+	case maps:get(stream_handlers, Opts, [cowboy_stream_h]) of
+		[] ->
+			Resp;
+		[Handler|Tail] ->
+			%% This is the same behavior as in init/3.
+			Handler:early_error(StreamID, Reason,
+				PartialReq, Resp, Opts#{stream_handlers => Tail})
+	end.
+
+-spec report_error(atom(), list(), error | exit | throw, any(), list()) -> ok.
+report_error(init, [StreamID, Req, Opts], Class, Exception, Stacktrace) ->
+	error_logger:error_msg(
+		"Unhandled exception ~p:~p in cowboy_stream:init(~p, Req, Opts)~n"
+		"Stacktrace: ~p~n"
+		"Req: ~p~n"
+		"Opts: ~p~n",
+		[Class, Exception, StreamID, Stacktrace, Req, Opts]);
+report_error(data, [StreamID, IsFin, Data, State], Class, Exception, Stacktrace) ->
+	error_logger:error_msg(
+		"Unhandled exception ~p:~p in cowboy_stream:data(~p, ~p, Data, State)~n"
+		"Stacktrace: ~p~n"
+		"Data: ~p~n"
+		"State: ~p~n",
+		[Class, Exception, StreamID, IsFin, Stacktrace, Data, State]);
+report_error(info, [StreamID, Msg, State], Class, Exception, Stacktrace) ->
+	error_logger:error_msg(
+		"Unhandled exception ~p:~p in cowboy_stream:info(~p, Msg, State)~n"
+		"Stacktrace: ~p~n"
+		"Msg: ~p~n"
+		"State: ~p~n",
+		[Class, Exception, StreamID, Stacktrace, Msg, State]);
+report_error(terminate, [StreamID, Reason, State], Class, Exception, Stacktrace) ->
+	error_logger:error_msg(
+		"Unhandled exception ~p:~p in cowboy_stream:terminate(~p, Reason, State)~n"
+		"Stacktrace: ~p~n"
+		"Reason: ~p~n"
+		"State: ~p~n",
+		[Class, Exception, StreamID, Stacktrace, Reason, State]);
+report_error(early_error, [StreamID, Reason, PartialReq, Resp, Opts], Class, Exception, Stacktrace) ->
+	error_logger:error_msg(
+		"Unhandled exception ~p:~p in cowboy_stream:early_error(~p, Reason, PartialReq, Resp, Opts)~n"
+		"Stacktrace: ~p~n"
+		"Reason: ~p~n"
+		"PartialReq: ~p~n"
+		"Resp: ~p~n"
+		"Opts: ~p~n",
+		[Class, Exception, StreamID, Stacktrace, Reason, PartialReq, Resp, Opts]);
+report_error(Callback, _, Class, Reason, Stacktrace) ->
+	error_logger:error_msg(
+		"Exception occurred in unknown callback ~p~n"
+		"Reason: ~p:~p~n"
+		"Stacktrace: ~p~n",
+		[Callback, Class, Reason, Stacktrace]).

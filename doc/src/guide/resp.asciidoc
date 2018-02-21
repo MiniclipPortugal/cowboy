@@ -37,7 +37,7 @@ use `cowboy_req:reply/3`:
 [source,erlang]
 ----
 Req = cowboy_req:reply(303, #{
-    <<"location">> => <<"http://ninenines.eu">>
+    <<"location">> => <<"https://ninenines.eu">>
 }, Req0).
 ----
 
@@ -128,7 +128,35 @@ in advance. This will ensure that the best response method
 is selected and help clients understand when the response
 is fully received.
 
-// @todo Document trailers here.
+Cowboy also provides a function to send response trailers.
+Response trailers are semantically equivalent to the headers
+you send in the response, only they are sent at the end.
+This is especially useful to attach information to the
+response that could not be generated until the response
+body was fully generated.
+
+Trailer fields must be listed in the trailer header. Any
+field not listed might be dropped by the client or an intermediary.
+
+[source,erlang]
+----
+Req = cowboy_req:stream_reply(200, #{
+    <<"content-type">> => <<"text/html">>,
+    <<"trailer">> => <<"expires, content-md5">>
+}, Req0),
+
+cowboy_req:stream_body("<html><head>Hello world!</head>", nofin, Req),
+cowboy_req:stream_body("<body><p>Hats off!</p></body></html>", nofin, Req),
+
+cowboy_req:stream_trailers(#{
+    <<"expires">> => <<"Sun, 10 Dec 2017 19:13:47 GMT">>,
+    <<"content-md5">> => <<"c6081d20ff41a42ce17048ed1c0345e2">>
+}, Req).
+----
+
+The stream ends with trailers. It is no longer possible to
+send data after sending trailers. You cannot send trailers
+after setting the `fin` flag when streaming the body.
 
 === Preset response headers
 
@@ -261,6 +289,29 @@ Req = cowboy_req:reply(200, #{
 // proper support for multipart byte ranges. Yet another
 // example would be automatic concatenation of CSS or JS
 // files.
+
+=== Informational responses
+
+Cowboy allows you to send informational responses.
+
+Informational responses are responses that have a status
+code between 100 and 199. Any number can be sent before
+the proper response. Sending an informational response
+does not change the behavior of the proper response, and
+clients are expected to ignore any informational response
+they do not understand.
+
+The following snippet sends a 103 informational response
+with some headers that are expected to be in the final
+response.
+
+[source,erlang]
+----
+Req = cowboy_req:inform(103, #{
+    <<"link">> => <<"</style.css>; rel=preload; as=style">>,
+    <<"link">> => <<"</script.js>; rel=preload; as=script">>
+}, Req0).
+----
 
 === Push
 

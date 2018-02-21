@@ -18,7 +18,17 @@ echo(<<"read_body">>, Req0, Opts) ->
 		_ -> ok
 	end,
 	{_, Body, Req} = case cowboy_req:path(Req0) of
+		<<"/100-continue", _/bits>> ->
+			cowboy_req:inform(100, Req0),
+			cowboy_req:read_body(Req0);
+		<<"/delay", _/bits>> ->
+			timer:sleep(500),
+			cowboy_req:read_body(Req0);
 		<<"/full", _/bits>> -> read_body(Req0, <<>>);
+		<<"/length", _/bits>> ->
+			{_, _, Req1} = read_body(Req0, <<>>),
+			Length = cowboy_req:body_length(Req1),
+			{ok, integer_to_binary(Length), Req1};
 		<<"/opts", _/bits>> -> cowboy_req:read_body(Req0, Opts);
 		_ -> cowboy_req:read_body(Req0)
 	end,
@@ -43,7 +53,7 @@ echo(<<"uri">>, Req, Opts) ->
 		[<<"no-qs">>] -> cowboy_req:uri(Req, #{qs => undefined});
 		[<<"no-path">>] -> cowboy_req:uri(Req, #{path => undefined, qs => undefined});
 		[<<"set-port">>] -> cowboy_req:uri(Req, #{port => 123});
-		[] -> cowboy_req:uri(Req)
+		_ -> cowboy_req:uri(Req)
 	end,
 	{ok, cowboy_req:reply(200, #{}, Value, Req), Opts};
 echo(<<"match">>, Req, Opts) ->
@@ -55,8 +65,11 @@ echo(<<"match">>, Req, Opts) ->
 	end,
 	{ok, cowboy_req:reply(200, #{}, value_to_iodata(Value), Req), Opts};
 echo(What, Req, Opts) ->
-	F = binary_to_atom(What, latin1),
-	Value = cowboy_req:F(Req),
+	Key = binary_to_atom(What, latin1),
+	Value = case cowboy_req:path(Req) of
+		<<"/direct/",_/bits>> -> maps:get(Key, Req);
+		_ -> cowboy_req:Key(Req)
+	end,
 	{ok, cowboy_req:reply(200, #{}, value_to_iodata(Value), Req), Opts}.
 
 echo_arg(Arg0, Req, Opts) ->

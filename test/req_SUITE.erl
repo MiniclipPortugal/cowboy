@@ -14,6 +14,7 @@
 
 -module(req_SUITE).
 -compile(export_all).
+-compile(nowarn_export_all).
 
 -import(ct_helper, [config/2]).
 -import(ct_helper, [doc/1]).
@@ -49,13 +50,15 @@ init_dispatch(Config) ->
 		{"/resp/:key[/:arg]", resp_h, []},
 		{"/multipart[/:key]", multipart_h, []},
 		{"/args/:key/:arg[/:default]", echo_h, []},
-		{"/crash/:key/period", echo_h, #{length => infinity, period => 1000, crash => true}},
+		{"/crash/:key/period", echo_h, #{length => 999999999, period => 1000, crash => true}},
 		{"/no-opts/:key", echo_h, #{crash => true}},
 		{"/opts/:key/length", echo_h, #{length => 1000}},
-		{"/opts/:key/period", echo_h, #{length => infinity, period => 1000}},
+		{"/opts/:key/period", echo_h, #{length => 999999999, period => 1000}},
 		{"/opts/:key/timeout", echo_h, #{timeout => 1000, crash => true}},
+		{"/100-continue/:key", echo_h, []},
 		{"/full/:key", echo_h, []},
 		{"/no/:key", echo_h, []},
+		{"/direct/:key/[...]", echo_h, []},
 		{"/:key/[...]", echo_h, []}
 	]}]).
 
@@ -82,9 +85,23 @@ do_body(Method, Path, Headers0, Body, Config) ->
 	gun:close(ConnPid),
 	do_decode(RespHeaders, RespBody).
 
-do_get(Path, Config) ->
+do_body_error(Method, Path, Headers0, Body, Config) ->
 	ConnPid = gun_open(Config),
-	Ref = gun:get(ConnPid, Path, [{<<"accept-encoding">>, <<"gzip">>}]),
+	Headers = [{<<"accept-encoding">>, <<"gzip">>}|Headers0],
+	Ref = case Body of
+		<<>> -> gun:request(ConnPid, Method, Path, Headers);
+		_ -> gun:request(ConnPid, Method, Path, Headers, Body)
+	end,
+	{response, _, Status, RespHeaders} = gun:await(ConnPid, Ref),
+	gun:close(ConnPid),
+	{Status, RespHeaders}.
+
+do_get(Path, Config) ->
+	do_get(Path, [], Config).
+
+do_get(Path, Headers, Config) ->
+	ConnPid = gun_open(Config),
+	Ref = gun:get(ConnPid, Path, [{<<"accept-encoding">>, <<"gzip">>}|Headers]),
 	{response, IsFin, Status, RespHeaders} = gun:await(ConnPid, Ref),
 	{ok, RespBody} = case IsFin of
 		nofin -> gun:await_body(ConnPid, Ref);
@@ -98,6 +115,30 @@ do_get_body(Path, Config) ->
 
 do_get_body(Path, Headers, Config) ->
 	do_body("GET", Path, Headers, Config).
+
+do_get_inform(Path, Config) ->
+	ConnPid = gun_open(Config),
+	Ref = gun:get(ConnPid, Path, [{<<"accept-encoding">>, <<"gzip">>}]),
+	case gun:await(ConnPid, Ref) of
+		{response, _, RespStatus, RespHeaders} ->
+			%% We don't care about the body.
+			gun:close(ConnPid),
+			{RespStatus, RespHeaders};
+		{inform, InfoStatus, InfoHeaders} ->
+			{response, IsFin, RespStatus, RespHeaders}
+				= case gun:await(ConnPid, Ref) of
+					{inform, InfoStatus, InfoHeaders} ->
+						gun:await(ConnPid, Ref);
+					Response ->
+						Response
+			end,
+			{ok, RespBody} = case IsFin of
+				nofin -> gun:await_body(ConnPid, Ref);
+				fin -> {ok, <<>>}
+			end,
+			gun:close(ConnPid),
+			{InfoStatus, InfoHeaders, RespStatus, RespHeaders, do_decode(RespHeaders, RespBody)}
+	end.
 
 do_decode(Headers, Body) ->
 	case lists:keyfind(<<"content-encoding">>, 1, Headers) of
@@ -114,10 +155,33 @@ binding(Config) ->
 	<<"default">> = do_get_body("/args/binding/undefined/default", Config),
 	ok.
 
-%% @todo Do we really want a key/value list here instead of a map?
 bindings(Config) ->
 	doc("Values bound from request URI path."),
-	<<"[{key,<<\"bindings\">>}]">> = do_get_body("/bindings", Config),
+	<<"#{key => <<\"bindings\">>}">> = do_get_body("/bindings", Config),
+	ok.
+
+cert(Config) ->
+	case config(type, Config) of
+		tcp -> doc("TLS certificates can only be provided over TLS.");
+		ssl -> do_cert(Config)
+	end.
+
+do_cert(Config0) ->
+	doc("A client TLS certificate was provided."),
+	{CaCert, Cert, Key} = ct_helper:make_certs(),
+	Config = [{transport_opts, [
+		{cert, Cert},
+		{key, Key},
+		{cacerts, [CaCert]}
+	]}|Config0],
+	Cert = do_get_body("/cert", Config),
+	Cert = do_get_body("/direct/cert", Config),
+	ok.
+
+cert_undefined(Config) ->
+	doc("No client TLS certificate was provided."),
+	<<"undefined">> = do_get_body("/cert", Config),
+	<<"undefined">> = do_get_body("/direct/cert", Config),
 	ok.
 
 header(Config) ->
@@ -129,14 +193,19 @@ header(Config) ->
 
 headers(Config) ->
 	doc("Request headers."),
+	do_headers("/headers", Config),
+	do_headers("/direct/headers", Config).
+
+do_headers(Path, Config) ->
 	%% We always send accept-encoding with this test suite's requests.
 	<<"#{<<\"accept-encoding\">> => <<\"gzip\">>,<<\"header\">> => <<\"value\">>", _/bits>>
-		= do_get_body("/headers", [{<<"header">>, "value"}], Config),
+		= do_get_body(Path, [{<<"header">>, "value"}], Config),
 	ok.
 
 host(Config) ->
 	doc("Request URI host."),
 	<<"localhost">> = do_get_body("/host", Config),
+	<<"localhost">> = do_get_body("/direct/host", Config),
 	ok.
 
 host_info(Config) ->
@@ -152,6 +221,9 @@ match_cookies(Config) ->
 	<<"#{c => <<\"d\">>}">> = do_get_body("/match/cookies/c", [{<<"cookie">>, "a=b; c=d"}], Config),
 	<<"#{a => <<\"b\">>,c => <<\"d\">>}">> = do_get_body("/match/cookies/a/c",
 		[{<<"cookie">>, "a=b; c=d"}], Config),
+	%% Ensure match errors result in a 400 response.
+	{400, _, _} = do_get("/match/cookies/a/c",
+		[{<<"cookie">>, "a=b"}], Config),
 	%% This function is tested more extensively through unit tests.
 	ok.
 
@@ -164,18 +236,24 @@ match_qs(Config) ->
 	<<"#{a => <<\"b\">>,c => <<\"d\">>}">> = do_get_body("/match/qs/a/c?a=b&c=d", Config),
 	<<"#{a => <<\"b\">>,c => true}">> = do_get_body("/match/qs/a/c?a=b&c", Config),
 	<<"#{a => true,c => <<\"d\">>}">> = do_get_body("/match/qs/a/c?a&c=d", Config),
+	%% Ensure match errors result in a 400 response.
+	{400, _, _} = do_get("/match/qs/a/c?a=b", [], Config),
 	%% This function is tested more extensively through unit tests.
 	ok.
 
 method(Config) ->
 	doc("Request method."),
-	<<"GET">> = do_body("GET", "/method", Config),
-	<<>> = do_body("HEAD", "/method", Config),
-	<<"OPTIONS">> = do_body("OPTIONS", "/method", Config),
-	<<"PATCH">> = do_body("PATCH", "/method", Config),
-	<<"POST">> = do_body("POST", "/method", Config),
-	<<"PUT">> = do_body("PUT", "/method", Config),
-	<<"ZZZZZZZZ">> = do_body("ZZZZZZZZ", "/method", Config),
+	do_method("/method", Config),
+	do_method("/direct/method", Config).
+
+do_method(Path, Config) ->
+	<<"GET">> = do_body("GET", Path, Config),
+	<<>> = do_body("HEAD", Path, Config),
+	<<"OPTIONS">> = do_body("OPTIONS", Path, Config),
+	<<"PATCH">> = do_body("PATCH", Path, Config),
+	<<"POST">> = do_body("POST", Path, Config),
+	<<"PUT">> = do_body("PUT", Path, Config),
+	<<"ZZZZZZZZ">> = do_body("ZZZZZZZZ", Path, Config),
 	ok.
 
 parse_cookies(Config) ->
@@ -188,6 +266,11 @@ parse_cookies(Config) ->
 	<<"[{<<\"cake\">>,<<\"strawberry\">>},{<<\"color\">>,<<\"blue\">>}]">>
 		= do_get_body("/parse_cookies",
 			[{<<"cookie">>, "cake=strawberry"}, {<<"cookie">>, "color=blue"}], Config),
+	%% Ensure parse errors result in a 400 response.
+	{400, _, _} = do_get("/parse_cookies",
+		[{<<"cookie">>, "bad name=strawberry"}], Config),
+	{400, _, _} = do_get("/parse_cookies",
+		[{<<"cookie">>, "goodname=strawberry\tmilkshake"}], Config),
 	ok.
 
 parse_header(Config) ->
@@ -202,6 +285,9 @@ parse_header(Config) ->
 	<<"undefined">> = do_get_body("/args/parse_header/upgrade", Config),
 	%% Header in request and with default provided.
 	<<"100-continue">> = do_get_body("/args/parse_header/expect/100-continue", Config),
+	%% Ensure parse errors result in a 400 response.
+	{400, _, _} = do_get("/args/parse_header/accept",
+		[{<<"accept">>, "bad media type"}], Config),
 	ok.
 
 parse_qs(Config) ->
@@ -209,14 +295,21 @@ parse_qs(Config) ->
 	<<"[]">> = do_get_body("/parse_qs", Config),
 	<<"[{<<\"abc\">>,true}]">> = do_get_body("/parse_qs?abc", Config),
 	<<"[{<<\"a\">>,<<\"b\">>},{<<\"c\">>,<<\"d e\">>}]">> = do_get_body("/parse_qs?a=b&c=d+e", Config),
+	%% Ensure parse errors result in a 400 response.
+	{400, _, _} = do_get("/parse_qs?%%%%%%%", Config),
 	ok.
 
 path(Config) ->
 	doc("Request URI path."),
-	<<"/path/to/the/resource">> = do_get_body("/path/to/the/resource", Config),
-	<<"/path/to/the/resource">> = do_get_body("/path/to/the/resource?query", Config),
-	<<"/path/to/the/resource">> = do_get_body("/path/to/the/resource?query#fragment", Config),
-	<<"/path/to/the/resource">> = do_get_body("/path/to/the/resource#fragment", Config),
+	do_path("/path", Config),
+	do_path("/direct/path", Config).
+
+do_path(Path0, Config) ->
+	Path = list_to_binary(Path0 ++ "/to/the/resource"),
+	Path = do_get_body(Path, Config),
+	Path = do_get_body([Path, "?query"], Config),
+	Path = do_get_body([Path, "?query#fragment"], Config),
+	Path = do_get_body([Path, "#fragment"], Config),
 	ok.
 
 path_info(Config) ->
@@ -231,30 +324,46 @@ path_info(Config) ->
 	ok.
 
 peer(Config) ->
-	doc("Request peer."),
+	doc("Remote socket address."),
 	<<"{{127,0,0,1},", _/bits >> = do_get_body("/peer", Config),
+	<<"{{127,0,0,1},", _/bits >> = do_get_body("/direct/peer", Config),
 	ok.
 
 port(Config) ->
 	doc("Request URI port."),
 	Port = integer_to_binary(config(port, Config)),
 	Port = do_get_body("/port", Config),
+	Port = do_get_body("/direct/port", Config),
 	ok.
 
 qs(Config) ->
 	doc("Request URI query string."),
-	<<>> = do_get_body("/qs", Config),
-	<<"abc">> = do_get_body("/qs?abc", Config),
-	<<"a=b&c=d+e">> = do_get_body("/qs?a=b&c=d+e", Config),
+	do_qs("/qs", Config),
+	do_qs("/direct/qs", Config).
+
+do_qs(Path, Config) ->
+	<<>> = do_get_body(Path, Config),
+	<<"abc">> = do_get_body(Path ++ "?abc", Config),
+	<<"a=b&c=d+e">> = do_get_body(Path ++ "?a=b&c=d+e", Config),
 	ok.
 
 scheme(Config) ->
 	doc("Request URI scheme."),
+	do_scheme("/scheme", Config),
+	do_scheme("/direct/scheme", Config).
+
+do_scheme(Path, Config) ->
 	Transport = config(type, Config),
-	case do_get_body("/scheme", Config) of
+	case do_get_body(Path, Config) of
 		<<"http">> when Transport =:= tcp -> ok;
 		<<"https">> when Transport =:= ssl -> ok
 	end.
+
+sock(Config) ->
+	doc("Local socket address."),
+	<<"{{127,0,0,1},", _/bits >> = do_get_body("/sock", Config),
+	<<"{{127,0,0,1},", _/bits >> = do_get_body("/direct/sock", Config),
+	ok.
 
 uri(Config) ->
 	doc("Request URI building/modification."),
@@ -287,8 +396,12 @@ uri(Config) ->
 
 version(Config) ->
 	doc("Request HTTP version."),
+	do_version("/version", Config),
+	do_version("/direct/version", Config).
+
+do_version(Path, Config) ->
 	Protocol = config(protocol, Config),
-	case do_get_body("/version", Config) of
+	case do_get_body(Path, Config) of
 		<<"HTTP/1.1">> when Protocol =:= http -> ok;
 		<<"HTTP/2">> when Protocol =:= http2 -> ok
 	end.
@@ -345,6 +458,33 @@ do_read_body_timeout(Path, Body, Config) ->
 	{response, _, 500, _} = gun:await(ConnPid, Ref),
 	gun:close(ConnPid).
 
+read_body_expect_100_continue(Config) ->
+	doc("Request body with a 100-continue expect header."),
+	do_read_body_expect_100_continue("/read_body", Config).
+
+read_body_expect_100_continue_user_sent(Config) ->
+	doc("Request body with a 100-continue expect header, 100 response sent by handler."),
+	do_read_body_expect_100_continue("/100-continue/read_body", Config).
+
+do_read_body_expect_100_continue(Path, Config) ->
+	ConnPid = gun_open(Config),
+	Body = <<0:8000000>>,
+	Headers = [
+		{<<"accept-encoding">>, <<"gzip">>},
+		{<<"expect">>, <<"100-continue">>},
+		{<<"content-length">>, integer_to_binary(byte_size(Body))}
+	],
+	Ref = gun:post(ConnPid, Path, Headers),
+	{inform, 100, []} = gun:await(ConnPid, Ref),
+	gun:data(ConnPid, Ref, fin, Body),
+	{response, IsFin, 200, RespHeaders} = gun:await(ConnPid, Ref),
+	{ok, RespBody} = case IsFin of
+		nofin -> gun:await_body(ConnPid, Ref);
+		fin -> {ok, <<>>}
+	end,
+	gun:close(ConnPid),
+	do_decode(RespHeaders, RespBody).
+
 read_urlencoded_body(Config) ->
 	doc("application/x-www-form-urlencoded request body."),
 	<<"[]">> = do_body("POST", "/read_urlencoded_body", [], <<>>, Config),
@@ -361,6 +501,8 @@ read_urlencoded_body(Config) ->
 	ok = do_read_urlencoded_body_too_long("/crash/read_urlencoded_body/period", <<"abc">>, Config),
 	%% The timeout value is set too low on purpose to ensure a crash occurs.
 	ok = do_read_body_timeout("/opts/read_urlencoded_body/timeout", <<"abc">>, Config),
+	%% Ensure parse errors result in a 400 response.
+	{400, _} = do_body_error("POST", "/read_urlencoded_body", [], "%%%%%", Config),
 	ok.
 
 %% We expect a crash.
@@ -370,7 +512,7 @@ do_read_urlencoded_body_too_large(Path, Body, Config) ->
 		{<<"content-length">>, integer_to_binary(iolist_size(Body))}
 	]),
 	gun:data(ConnPid, Ref, fin, Body),
-	{response, _, 500, _} = gun:await(ConnPid, Ref),
+	{response, _, 413, _} = gun:await(ConnPid, Ref),
 	gun:close(ConnPid).
 
 %% We expect a crash.
@@ -382,7 +524,14 @@ do_read_urlencoded_body_too_long(Path, Body, Config) ->
 	gun:data(ConnPid, Ref, nofin, Body),
 	timer:sleep(1100),
 	gun:data(ConnPid, Ref, fin, Body),
-	{response, _, 500, _} = gun:await(ConnPid, Ref),
+	{response, _, 408, RespHeaders} = gun:await(ConnPid, Ref),
+	_ = case config(protocol, Config) of
+		http ->
+			%% 408 error responses should close HTTP/1.1 connections.
+			{_, <<"close">>} = lists:keyfind(<<"connection">>, 1, RespHeaders);
+		http2 ->
+			ok
+	end,
 	gun:close(ConnPid).
 
 multipart(Config) ->
@@ -400,14 +549,71 @@ do_multipart(Path, Config) ->
 		{<<"content-type">>, <<"multipart/mixed; boundary=deadbeef">>}
 	], ReqBody, Config),
 	[
-		{[{<<"content-type">>, <<"text/plain">>}], <<"Cowboy is an HTTP server.">>},
+		{#{<<"content-type">> := <<"text/plain">>}, <<"Cowboy is an HTTP server.">>},
 		{LargeHeaders, LargeBody}
 	] = binary_to_term(RespBody),
-	%% @todo Multipart header order is currently undefined.
-	[
-		{<<"content-type">>, <<"application/octet-stream">>},
-		{<<"x-custom">>, <<"value">>}
-	] = lists:sort(LargeHeaders),
+	#{
+		<<"content-type">> := <<"application/octet-stream">>,
+		<<"x-custom">> := <<"value">>
+	} = LargeHeaders,
+	ok.
+
+multipart_error_empty(Config) ->
+	doc("Multipart request body is empty."),
+	%% We use an empty list as a body to make sure Gun knows
+	%% we want to send an empty body.
+	%% @todo This is a terrible hack. Improve Gun!
+	Body = [],
+	%% Ensure an empty body results in a 400 error.
+	{400, _} = do_body_error("POST", "/multipart", [
+		{<<"content-type">>, <<"multipart/mixed; boundary=deadbeef">>}
+	], Body, Config),
+	ok.
+
+multipart_error_preamble_only(Config) ->
+	doc("Multipart request body only contains a preamble."),
+	%% Ensure an empty body results in a 400 error.
+	{400, _} = do_body_error("POST", "/multipart", [
+		{<<"content-type">>, <<"multipart/mixed; boundary=deadbeef">>}
+	], <<"Preamble.">>, Config),
+	ok.
+
+multipart_error_headers(Config) ->
+	doc("Multipart request body with invalid part headers."),
+	ReqBody = [
+		"--deadbeef\r\nbad-header text/plain\r\n\r\nCowboy is an HTTP server.\r\n"
+		"--deadbeef--"
+	],
+	%% Ensure parse errors result in a 400 response.
+	{400, _} = do_body_error("POST", "/multipart", [
+		{<<"content-type">>, <<"multipart/mixed; boundary=deadbeef">>}
+	], ReqBody, Config),
+	ok.
+
+%% The function to parse the multipart body currently does not crash,
+%% as far as I can tell. There is therefore no test for it.
+
+multipart_error_no_final_boundary(Config) ->
+	doc("Multipart request body with no final boundary."),
+	ReqBody = [
+		"--deadbeef\r\nContent-Type: text/plain\r\n\r\nCowboy is an HTTP server.\r\n"
+	],
+	%% Ensure parse errors result in a 400 response.
+	{400, _} = do_body_error("POST", "/multipart", [
+		{<<"content-type">>, <<"multipart/mixed; boundary=deadbeef">>}
+	], ReqBody, Config),
+	ok.
+
+multipart_missing_boundary(Config) ->
+	doc("Multipart request body without a boundary in the media type."),
+	ReqBody = [
+		"--deadbeef\r\nContent-Type: text/plain\r\n\r\nCowboy is an HTTP server.\r\n"
+		"--deadbeef--"
+	],
+	%% Ensure parse errors result in a 400 response.
+	{400, _} = do_body_error("POST", "/multipart", [
+		{<<"content-type">>, <<"multipart/mixed">>}
+	], ReqBody, Config),
 	ok.
 
 read_part_skip_body(Config) ->
@@ -422,14 +628,13 @@ read_part_skip_body(Config) ->
 		{<<"content-type">>, <<"multipart/mixed; boundary=deadbeef">>}
 	], ReqBody, Config),
 	[
-		[{<<"content-type">>, <<"text/plain">>}],
+		#{<<"content-type">> := <<"text/plain">>},
 		LargeHeaders
 	] = binary_to_term(RespBody),
-	%% @todo Multipart header order is currently undefined.
-	[
-		{<<"content-type">>, <<"application/octet-stream">>},
-		{<<"x-custom">>, <<"value">>}
-	] = lists:sort(LargeHeaders),
+	#{
+		<<"content-type">> := <<"application/octet-stream">>,
+		<<"x-custom">> := <<"value">>
+	} = LargeHeaders,
 	ok.
 
 %% @todo When reading a multipart body, length and period
@@ -512,6 +717,27 @@ set_resp_body(Config) ->
 	{200, _, AppFile} = do_get("/resp/set_resp_body/sendfile", Config),
 	ok.
 
+set_resp_body_sendfile0(Config) ->
+	doc("Response using set_resp_body with a sendfile of length 0."),
+	Path = "/resp/set_resp_body/sendfile0",
+	ConnPid = gun_open(Config),
+	%% First request.
+	Ref1 = gun:get(ConnPid, Path, [{<<"accept-encoding">>, <<"gzip">>}]),
+	{response, IsFin, 200, _} = gun:await(ConnPid, Ref1),
+	{ok, <<>>} = case IsFin of
+		nofin -> gun:await_body(ConnPid, Ref1);
+		fin -> {ok, <<>>}
+	end,
+	%% Second request will confirm everything works as intended.
+	Ref2 = gun:get(ConnPid, Path, [{<<"accept-encoding">>, <<"gzip">>}]),
+	{response, IsFin, 200, _} = gun:await(ConnPid, Ref2),
+	{ok, <<>>} = case IsFin of
+		nofin -> gun:await_body(ConnPid, Ref2);
+		fin -> {ok, <<>>}
+	end,
+	gun:close(ConnPid),
+	ok.
+
 has_resp_header(Config) ->
 	doc("Has response header?"),
 	{200, Headers, <<"OK">>} = do_get("/resp/has_resp_header", Config),
@@ -528,6 +754,23 @@ delete_resp_header(Config) ->
 	doc("Delete response header."),
 	{200, Headers, <<"OK">>} = do_get("/resp/delete_resp_header", Config),
 	false = lists:keymember(<<"content-type">>, 1, Headers),
+	ok.
+
+inform2(Config) ->
+	doc("Informational response(s) without headers, followed by the real response."),
+	{102, [], 200, _, _} = do_get_inform("/resp/inform2/102", Config),
+	{102, [], 200, _, _} = do_get_inform("/resp/inform2/binary", Config),
+	{500, _} = do_get_inform("/resp/inform2/error", Config),
+	{102, [], 200, _, _} = do_get_inform("/resp/inform2/twice", Config),
+	ok.
+
+inform3(Config) ->
+	doc("Informational response(s) with headers, followed by the real response."),
+	Headers = [{<<"ext-header">>, <<"ext-value">>}],
+	{102, Headers, 200, _, _} = do_get_inform("/resp/inform3/102", Config),
+	{102, Headers, 200, _, _} = do_get_inform("/resp/inform3/binary", Config),
+	{500, _} = do_get_inform("/resp/inform3/error", Config),
+	{102, Headers, 200, _, _} = do_get_inform("/resp/inform3/twice", Config),
 	ok.
 
 reply2(Config) ->
@@ -585,9 +828,69 @@ stream_reply3(Config) ->
 	{500, _, _} = do_get("/resp/stream_reply3/error", Config),
 	ok.
 
+stream_body_multiple(Config) ->
+	doc("Streamed body via multiple calls."),
+	{200, _, <<"Hello world!">>} = do_get("/resp/stream_body/multiple", Config),
+	ok.
+
+stream_body_fin0(Config) ->
+	doc("Streamed body with last chunk of size 0."),
+	{200, _, <<"Hello world!">>} = do_get("/resp/stream_body/fin0", Config),
+	ok.
+
+stream_body_nofin(Config) ->
+	doc("Unfinished streamed body."),
+	{200, _, <<"Hello world!">>} = do_get("/resp/stream_body/nofin", Config),
+	ok.
+
 %% @todo Crash when calling stream_body after the fin flag has been set.
 %% @todo Crash when calling stream_body after calling reply.
 %% @todo Crash when calling stream_body before calling stream_reply.
+
+stream_trailers(Config) ->
+	doc("Stream body followed by trailer headers."),
+	{200, RespHeaders, <<"Hello world!">>, [
+		{<<"grpc-status">>, <<"0">>}
+	]} = do_trailers("/resp/stream_trailers", Config),
+	{_, <<"grpc-status">>} = lists:keyfind(<<"trailer">>, 1, RespHeaders),
+	ok.
+
+stream_trailers_large(Config) ->
+	doc("Stream large body followed by trailer headers."),
+	{200, RespHeaders, <<0:800000>>, [
+		{<<"grpc-status">>, <<"0">>}
+	]} = do_trailers("/resp/stream_trailers/large", Config),
+	{_, <<"grpc-status">>} = lists:keyfind(<<"trailer">>, 1, RespHeaders),
+	ok.
+
+stream_trailers_no_te(Config) ->
+	doc("Stream body followed by trailer headers without a te header in the request."),
+	ConnPid = gun_open(Config),
+	Ref = gun:get(ConnPid, "/resp/stream_trailers", [
+		{<<"accept-encoding">>, <<"gzip">>}
+	]),
+	{response, nofin, 200, RespHeaders} = gun:await(ConnPid, Ref),
+	%% @todo Do we want to remove the trailer header automatically?
+%	false = lists:keyfind(<<"trailer">>, 1, RespHeaders),
+	{ok, RespBody} = gun:await_body(ConnPid, Ref),
+	<<"Hello world!">> = do_decode(RespHeaders, RespBody),
+	gun:close(ConnPid).
+
+do_trailers(Path, Config) ->
+	ConnPid = gun_open(Config),
+	Ref = gun:get(ConnPid, Path, [
+		{<<"accept-encoding">>, <<"gzip">>},
+		{<<"te">>, <<"trailers">>}
+	]),
+	{response, nofin, Status, RespHeaders} = gun:await(ConnPid, Ref),
+	{ok, RespBody, Trailers} = gun:await_body(ConnPid, Ref),
+	gun:close(ConnPid),
+	{Status, RespHeaders, do_decode(RespHeaders, RespBody), Trailers}.
+
+%% @todo Crash when calling stream_trailers twice.
+%% @todo Crash when calling stream_trailers after the fin flag has been set.
+%% @todo Crash when calling stream_trailers after calling reply.
+%% @todo Crash when calling stream_trailers before calling stream_reply.
 
 %% Tests: Push.
 

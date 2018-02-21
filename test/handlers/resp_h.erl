@@ -20,7 +20,8 @@ do(<<"set_resp_cookie3">>, Req0, Opts) ->
 	end,
 	{ok, cowboy_req:reply(200, #{}, "OK", Req), Opts};
 do(<<"set_resp_cookie4">>, Req0, Opts) ->
-	Req = cowboy_req:set_resp_cookie(<<"mycookie">>, "myvalue", #{path => cowboy_req:path(Req0)}, Req0),
+	Req = cowboy_req:set_resp_cookie(<<"mycookie">>, "myvalue", Req0,
+		#{path => cowboy_req:path(Req0)}),
 	{ok, cowboy_req:reply(200, #{}, "OK", Req), Opts};
 do(<<"set_resp_header">>, Req0, Opts) ->
 	Req = cowboy_req:set_resp_header(<<"content-type">>, <<"text/plain">>, Req0),
@@ -57,6 +58,9 @@ do(<<"resp_headers_empty">>, Req, Opts) ->
 do(<<"set_resp_body">>, Req0, Opts) ->
 	Arg = cowboy_req:binding(arg, Req0),
 	Req1 = case Arg of
+		<<"sendfile0">> ->
+			AppFile = code:where_is_file("cowboy.app"),
+			cowboy_req:set_resp_body({sendfile, 0, 0, AppFile}, Req0);
 		<<"sendfile">> ->
 			AppFile = code:where_is_file("cowboy.app"),
 			cowboy_req:set_resp_body({sendfile, 0, filelib:file_size(AppFile), AppFile}, Req0);
@@ -90,12 +94,46 @@ do(<<"has_resp_body">>, Req0, Opts) ->
 			{ok, cowboy_req:reply(200, #{}, Req), Opts}
 	end;
 do(<<"delete_resp_header">>, Req0, Opts) ->
-	false = cowboy_req:has_resp_header(<<"content-type">>, Req0),
-	Req1 = cowboy_req:set_resp_header(<<"content-type">>, <<"text/plain">>, Req0),
-	true = cowboy_req:has_resp_header(<<"content-type">>, Req1),
-	Req = cowboy_req:delete_resp_header(<<"content-type">>, Req1),
+	%% We try to delete first even though it hasn't been set to
+	%% make sure this noop is possible.
+	Req1 = cowboy_req:delete_resp_header(<<"content-type">>, Req0),
+	false = cowboy_req:has_resp_header(<<"content-type">>, Req1),
+	Req2 = cowboy_req:set_resp_header(<<"content-type">>, <<"text/plain">>, Req1),
+	true = cowboy_req:has_resp_header(<<"content-type">>, Req2),
+	Req = cowboy_req:delete_resp_header(<<"content-type">>, Req2),
 	false = cowboy_req:has_resp_header(<<"content-type">>, Req),
 	{ok, cowboy_req:reply(200, #{}, "OK", Req), Opts};
+do(<<"inform2">>, Req0, Opts) ->
+	case cowboy_req:binding(arg, Req0) of
+		<<"binary">> ->
+			cowboy_req:inform(<<"102 On my way">>, Req0);
+		<<"error">> ->
+			ct_helper:ignore(cowboy_req, inform, 3),
+			cowboy_req:inform(ok, Req0);
+		<<"twice">> ->
+			cowboy_req:inform(102, Req0),
+			cowboy_req:inform(102, Req0);
+		Status ->
+			cowboy_req:inform(binary_to_integer(Status), Req0)
+	end,
+	Req = cowboy_req:reply(200, Req0),
+	{ok, Req, Opts};
+do(<<"inform3">>, Req0, Opts) ->
+	Headers = #{<<"ext-header">> => <<"ext-value">>},
+	case cowboy_req:binding(arg, Req0) of
+		<<"binary">> ->
+			cowboy_req:inform(<<"102 On my way">>, Headers, Req0);
+		<<"error">> ->
+			ct_helper:ignore(cowboy_req, inform, 3),
+			cowboy_req:inform(ok, Headers, Req0);
+		<<"twice">> ->
+			cowboy_req:inform(102, Headers, Req0),
+			cowboy_req:inform(102, Headers, Req0);
+		Status ->
+			cowboy_req:inform(binary_to_integer(Status), Headers, Req0)
+	end,
+	Req = cowboy_req:reply(200, Req0),
+	{ok, Req, Opts};
 do(<<"reply2">>, Req0, Opts) ->
 	Req = case cowboy_req:binding(arg, Req0) of
 		<<"binary">> ->
@@ -153,10 +191,49 @@ do(<<"stream_reply3">>, Req0, Opts) ->
 	end,
 	stream_body(Req),
 	{ok, Req, Opts};
-do(<<"stream_body">>, Req, Opts) ->
-	%% Call stream_body without initiating streaming.
-	cowboy_req:stream_body(<<0:800000>>, fin, Req),
-	{ok, Req, Opts};
+do(<<"stream_body">>, Req0, Opts) ->
+	case cowboy_req:binding(arg, Req0) of
+		<<"fin0">> ->
+			Req = cowboy_req:stream_reply(200, Req0),
+			cowboy_req:stream_body(<<"Hello world!">>, nofin, Req),
+			cowboy_req:stream_body(<<>>, fin, Req),
+			{ok, Req, Opts};
+		<<"multiple">> ->
+			Req = cowboy_req:stream_reply(200, Req0),
+			cowboy_req:stream_body(<<"Hello ">>, nofin, Req),
+			cowboy_req:stream_body(<<"world">>, nofin, Req),
+			cowboy_req:stream_body(<<"!">>, fin, Req),
+			{ok, Req, Opts};
+		<<"nofin">> ->
+			Req = cowboy_req:stream_reply(200, Req0),
+			cowboy_req:stream_body(<<"Hello world!">>, nofin, Req),
+			{ok, Req, Opts};
+		_ ->
+			%% Call stream_body without initiating streaming.
+			cowboy_req:stream_body(<<0:800000>>, fin, Req0),
+			{ok, Req0, Opts}
+	end;
+do(<<"stream_trailers">>, Req0, Opts) ->
+	case cowboy_req:binding(arg, Req0) of
+		<<"large">> ->
+			Req = cowboy_req:stream_reply(200, #{
+				<<"trailer">> => <<"grpc-status">>
+			}, Req0),
+			cowboy_req:stream_body(<<0:800000>>, nofin, Req),
+			cowboy_req:stream_trailers(#{
+				<<"grpc-status">> => <<"0">>
+			}, Req),
+			{ok, Req, Opts};
+		_ ->
+			Req = cowboy_req:stream_reply(200, #{
+				<<"trailer">> => <<"grpc-status">>
+			}, Req0),
+			cowboy_req:stream_body(<<"Hello world!">>, nofin, Req),
+			cowboy_req:stream_trailers(#{
+				<<"grpc-status">> => <<"0">>
+			}, Req),
+			{ok, Req, Opts}
+	end;
 do(<<"push">>, Req, Opts) ->
 	case cowboy_req:binding(arg, Req) of
 		<<"method">> ->
