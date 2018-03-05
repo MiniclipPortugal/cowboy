@@ -1,3 +1,4 @@
+% vim: set noexpandtab softtabstop=4 shiftwidth=4:
 %% Copyright (c) 2011-2017, Loïc Hoguin <essen@ninenines.eu>
 %%
 %% Permission to use, copy, modify, and/or distribute this software for any
@@ -58,7 +59,7 @@
 -export_type([opts/0]).
 
 -record(state, {
-	socket = undefined :: inet:socket() | undefined,
+	socket = undefined :: gen_tcp:socket() | ssl:sslsocket() | tuple() | undefined,
 	transport = undefined :: module(),
 	handler :: module(),
 	key = undefined :: undefined | binary(),
@@ -237,14 +238,15 @@ handler_loop_timeout(State=#state{timeout=Timeout, timeout_ref=PrevRef}) ->
 	-> {ok, cowboy_middleware:env()}.
 handler_loop(State=#state{socket=Socket, messages={OK, Closed, Error},
 		timeout_ref=TRef}, HandlerState, SoFar) ->
+	SocketSender = socket_sender(Socket),
 	receive
-		{OK, Socket, Data} ->
+		{OK, SocketSender, Data} ->
 			State2 = handler_loop_timeout(State),
 			websocket_data(State2, HandlerState,
 				<< SoFar/binary, Data/binary >>);
-		{Closed, Socket} ->
+		{Closed, SocketSender} ->
 			terminate(State, HandlerState, {error, closed});
-		{Error, Socket, Reason} ->
+		{Error, SocketSender, Reason} ->
 			terminate(State, HandlerState, {error, Reason});
 		{timeout, TRef, ?MODULE} ->
 			websocket_close(State, HandlerState, timeout);
@@ -295,14 +297,15 @@ websocket_payload_loop(State=#state{socket=Socket, transport=Transport,
 		messages={OK, Closed, Error}, timeout_ref=TRef},
 		HandlerState, Type, Len, MaskKey, Rsv, CloseCode, Unmasked, UnmaskedLen) ->
 	Transport:setopts(Socket, [{active, once}]),
+	SocketSender = socket_sender(Socket),
 	receive
-		{OK, Socket, Data} ->
+		{OK, SocketSender, Data} ->
 			State2 = handler_loop_timeout(State),
 			websocket_payload(State2, HandlerState,
 				Type, Len, MaskKey, Rsv, CloseCode, Unmasked, UnmaskedLen, Data);
-		{Closed, Socket} ->
+		{Closed, SocketSender} ->
 			terminate(State, HandlerState, {error, closed});
-		{Error, Socket, Reason} ->
+		{Error, SocketSender, Reason} ->
 			terminate(State, HandlerState, {error, Reason});
 		{timeout, TRef, ?MODULE} ->
 			websocket_close(State, HandlerState, timeout);
@@ -437,3 +440,9 @@ terminate(State, HandlerState, Reason) ->
 
 handler_terminate(#state{handler=Handler, req=Req}, HandlerState, Reason) ->
 	cowboy_handler:terminate(Reason, Req, HandlerState, Handler).
+
+socket_sender({proxy_socket, _LSocket, CSocket, _Opts, _InetVersion,
+			   _SourceAddr, _DestAddr, _SourcePort, _DestPort, _ConnInfo}) ->
+	CSocket;
+socket_sender(OrdinarySocket) ->
+	OrdinarySocket.

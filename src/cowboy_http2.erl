@@ -1,3 +1,4 @@
+% vim: set noexpandtab softtabstop=4 shiftwidth=4:
 %% Copyright (c) 2015-2017, Loïc Hoguin <essen@ninenines.eu>
 %%
 %% Permission to use, copy, modify, and/or distribute this software for any
@@ -62,7 +63,7 @@
 -record(state, {
 	parent = undefined :: pid(),
 	ref :: ranch:ref(),
-	socket = undefined :: inet:socket(),
+	socket = undefined :: gen_tcp:socket() | ssl:sslsocket() | tuple(),
 	transport :: module(),
 	opts = #{} :: opts(),
 
@@ -134,7 +135,7 @@
 
 -spec init(pid(), ranch:ref(), inet:socket(), module(), cowboy:opts()) -> ok.
 init(Parent, Ref, Socket, Transport, Opts) ->
-	Peer0 = Transport:peername(Socket),
+	Peer0 = peername(Transport, Socket),
 	Sock0 = Transport:sockname(Socket),
 	Cert1 = case Transport:name() of
 		ssl ->
@@ -215,13 +216,14 @@ loop(State=#state{parent=Parent, socket=Socket, transport=Transport,
 	Transport:setopts(Socket, [{active, once}]),
 	{OK, Closed, Error} = Transport:messages(),
 	InactivityTimeout = maps:get(inactivity_timeout, Opts, 300000),
+	SocketSender = socket_sender(Socket),
 	receive
 		%% Socket messages.
-		{OK, Socket, Data} ->
+		{OK, SocketSender, Data} ->
 			parse(State, << Buffer/binary, Data/binary >>);
-		{Closed, Socket} ->
+		{Closed, SocketSender} ->
 			terminate(State, {socket_error, closed, 'The socket has been closed.'});
-		{Error, Socket, Reason} ->
+		{Error, SocketSender, Reason} ->
 			terminate(State, {socket_error, Reason, 'An error has occurred on the socket.'});
 		%% System messages.
 		{'EXIT', Parent, Reason} ->
@@ -1133,3 +1135,16 @@ system_terminate(Reason, _, _, {State, _}) ->
 -spec system_code_change(Misc, _, _, _) -> {ok, Misc} when Misc::{#state{}, binary()}.
 system_code_change(Misc, _, _, _) ->
 	{ok, Misc}.
+
+socket_sender({proxy_socket, _LSocket, CSocket, _Opts, _InetVersion,
+			   _SourceAddr, _DestAddr, _SourcePort, _DestPort, _ConnInfo}) ->
+	CSocket;
+socket_sender(OrdinarySocket) ->
+	OrdinarySocket.
+
+peername(ranch_proxy, ProxiedSocket) ->
+	% work around the fact that ranch_proxy:peername/1 insists on giving us the socket peername
+	{ok, {{SourceAddress, SourcePort}, {_DestAddress, _DestPort}}} = ranch_proxy:proxyname(ProxiedSocket),
+	{ok, {SourceAddress, SourcePort}};
+peername(Transport, Socket) ->
+	Transport:peername(Socket).
